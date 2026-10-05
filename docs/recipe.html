@@ -10,7 +10,7 @@
 main{max-width:720px;margin:auto;padding:18px 16px 55px}.hero{width:100%;max-height:330px;object-fit:cover;border-radius:16px;background:#10252e}
 h1{font-family:Georgia,serif;font-size:2.3rem;margin:15px 0 5px}.desc{color:#59666b;line-height:1.5}
 .card{background:white;border:1px solid #ddd8cc;border-radius:14px;padding:18px;margin-top:18px}
-h2{font-size:1.05rem;letter-spacing:.05em;margin:0 0 12px}.item{padding:12px 0;border-top:1px solid #eee}
+h2{font-size:1.05rem;letter-spacing:.05em;margin:0 0 12px}.item{padding:12px 0;border-top:1px solid #eee;overflow-wrap:anywhere}
 .item:first-of-type{border-top:0}.amount{color:#a66d0c;font-weight:750}.product{margin-top:5px;font-weight:650}
 .loc{color:#2e7d45;font-size:.9rem;margin-top:3px}.muted{color:#59666b;font-size:.9rem}
 ol{padding-left:22px;line-height:1.6}li{padding-bottom:8px}
@@ -30,6 +30,10 @@ const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_I2_StEDOjJ4sIj3ZpENZ9w_9JT40_Fk
 const app = document.getElementById("app");
 const params = new URLSearchParams(location.search);
 const cocktailId = Number(params.get("cocktail_id"));
+const list = value => Array.isArray(value) ? value : [];
+const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
+const owns = (obj,key) => Object.prototype.hasOwnProperty.call(obj,String(key));
+const nameOf = ing => ing.displayName || ing.ingredientName || "Ingredient";
 function el(tag, className, value) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -44,16 +48,16 @@ function fail(message) {
   retry.addEventListener("click",load);
   card.append(retry);app.append(card);
 }
-function selectedProducts() {
-  const encoded=params.get("items");
+function selections(parameter) {
+  const encoded=params.get(parameter);
   if (!encoded) return {};
   try {
-    if (encoded.length>5000) return {};
+    if (encoded.length>16000) return {};
     const normalized=encoded.replace(/-/g,"+").replace(/_/g,"/");
     const binary=atob(normalized);
     const bytes=Uint8Array.from(binary,c=>c.charCodeAt(0));
     const obj=JSON.parse(new TextDecoder().decode(bytes));
-    return obj && typeof obj==="object" && !Array.isArray(obj) ? obj : {};
+    return record(obj) ? obj : {};
   } catch {return {};}
 }
 function directions(value) {
@@ -67,19 +71,85 @@ function directions(value) {
 function imageUrl(path) {
   if (!path || typeof path!=="string")return "";
   if (/^https:\/\//i.test(path))return path;
-  // Supabase public bucket convention; adjust if your image_path uses a different bucket.
-  return `${SUPABASE_URL}/storage/v1/object/public/cocktail-images/${path.replace(/^\/+/,"").split("/").map(encodeURIComponent).join("/")}`;
+  const relative=path.replace(/^\/+/,"").replace(/^cocktail-images\//,"");
+  return `${SUPABASE_URL}/storage/v1/object/public/cocktail-images/${relative.split("/").map(encodeURIComponent).join("/")}`;
 }
 function locationText(locations) {
-  if (!Array.isArray(locations))return "";
-  return locations.map(l=>{
-    if (!l || typeof l!=="object")return "";
+  return list(locations).map(l=>{
+    if (!record(l))return "";
     if (l.locationLabel)return String(l.locationLabel);
     return [l.aisle&&`Aisle ${l.aisle}`,l.section&&`Section ${l.section}`,l.shelf&&`Shelf ${l.shelf}`,l.position&&`Position ${l.position}`].filter(Boolean).join(" • ");
   }).filter(Boolean).join(" / ");
 }
+function ingredientGroups(cocktail) {
+  if (Array.isArray(cocktail.ingredientGroups)) {
+    return cocktail.ingredientGroups.filter(record).map((group,index)=>({
+      ...group,
+      requirementKey:group.requirementKey || `response_group_${index}`,
+      alternatives:list(group.alternatives).filter(record)
+    })).filter(group=>group.alternatives.length);
+  }
+  // Older RPC responses: use explicit group IDs, never matching ingredient names.
+  const grouped=new Map();
+  for (const ing of list(cocktail.ingredients).filter(record)) {
+    const key=ing.requirementGroup !== null && ing.requirementGroup !== undefined
+      ? `group_${ing.requirementGroup}` : `row_${ing.cocktailIngredientId ?? ing.ingredientId}`;
+    if (!grouped.has(key)) grouped.set(key,{requirementKey:key,alternatives:[]});
+    grouped.get(key).alternatives.push(ing);
+  }
+  return [...grouped.values()].map(group=>({
+    ...group,blocking:group.alternatives.some(ing=>ing.blocking === true ||
+      (ing.required === true && ing.garnish !== true))
+  }));
+}
+function hasStock(product) {
+  return product.quantityOnHand === null || product.quantityOnHand === undefined ||
+    Number(product.quantityOnHand)>0;
+}
+function isAvailable(ing) {
+  if (typeof ing.available === "boolean") return ing.available;
+  if (ing.status) return ing.status === "inStock" || ing.status === "alwaysAvailable";
+  return list(ing.products).filter(record).some(hasStock);
+}
+function resolveSelection(group,items,savedGroups) {
+  const alternatives=group.alternatives;
+  let ing, requested, explicitProduct=false;
+  const saved=owns(savedGroups,group.requirementKey) ? savedGroups[group.requirementKey] : null;
+  if (record(saved)) {
+    ing=alternatives.find(a=>String(a.cocktailIngredientId ?? a.ingredientId) === String(saved.cocktailIngredientId) &&
+      (saved.ingredientId === undefined || String(a.ingredientId) === String(saved.ingredientId)));
+    if (!ing) return {ing:null,product:null,notice:"The ingredient selected on the tablet is no longer returned for this group."};
+    // A null inventoryId is an intentional choice without a store product.
+    requested=saved.inventoryId;
+    explicitProduct=true;
+  } else {
+    // Flutter's items keys are cocktailIngredientId; support older ingredientId keys too.
+    ing=alternatives.find(a=>owns(items,a.cocktailIngredientId ?? a.ingredientId));
+    if (ing) requested=items[String(ing.cocktailIngredientId ?? ing.ingredientId)];
+    else {
+      ing=alternatives.find(a=>owns(items,a.ingredientId));
+      if (ing) requested=items[String(ing.ingredientId)];
+    }
+    if (ing) explicitProduct=true;
+    if (!ing) ing=alternatives.find(a=>isAvailable(a) && (!group.blocking ||
+      a.blocking === true || (a.required === true && a.garnish !== true))) || alternatives[0];
+  }
+  const products=list(ing.products).filter(record);
+  // Preserve a QR selection even if stock changes; never silently swap products.
+  const product=explicitProduct
+    ? products.find(p=>requested !== null && requested !== undefined && String(p.inventoryId)===String(requested))
+    : isAvailable(ing) ? products.find(hasStock) : undefined;
+  let notice="";
+  if (explicitProduct && requested !== null && requested !== undefined && !product)
+    notice="The selected store product is no longer listed for this ingredient. Ask store staff for assistance.";
+  else if (product && !hasStock(product))
+    notice="The selected store product is currently out of stock.";
+  else if (explicitProduct && !isAvailable(ing))
+    notice="Availability for this selected ingredient has changed. Ask store staff for assistance.";
+  return {ing,product,notice};
+}
 function render(cocktail) {
-  const chosen=selectedProducts();
+  const items=selections("items"), savedGroups=selections("groups");
   app.replaceChildren();
   const src=imageUrl(cocktail.image_path);
   if(src){const img=el("img","hero");img.src=src;img.alt=`${cocktail.cocktail_name} cocktail`;img.onerror=()=>img.remove();app.append(img);}
@@ -87,31 +157,31 @@ function render(cocktail) {
   if(cocktail.description)app.append(el("p","desc",cocktail.description));
   if(cocktail.serving_size)app.append(el("p","muted",`Serving size: ${cocktail.serving_size}`));
   const card=el("section","card");card.append(el("h2","","INGREDIENTS"));
-  const ingredients=Array.isArray(cocktail.ingredients)?cocktail.ingredients:[];
-  for(const ing of ingredients){
-    const row=el("div","item");
-    const qty=ing.displayQuantity || [ing.requiredQuantity,ing.requiredUnit].filter(x=>x!==null&&x!==undefined&&x!=="").join(" ");
-    const heading=el("div");
-    if(qty)heading.append(el("span","amount",`${qty}  `));
-    heading.append(document.createTextNode(ing.displayName||ing.ingredientName||"Ingredient"));
-    row.append(heading);
-    const products=Array.isArray(ing.products)?ing.products.filter(p=>Number(p.quantityOnHand)>0):[];
-    // Confirm the selected product belongs to this ingredient's returned products.
-    const requested=chosen[String(ing.ingredientId)];
-    const product=products.find(p=>String(p.inventoryId)===String(requested))||products[0];
-    if(product){
-      const label=[product.brand,product.productName, [product.packageQuantity,product.packageUnit].filter(x=>x!==null&&x!==undefined&&x!=="").join(" ")].filter(Boolean);
-      // Avoid repeating brand if already present in product name.
-      if(label[0]&&label[1]&&String(label[1]).toLowerCase().includes(String(label[0]).toLowerCase()))label.shift();
-      row.append(el("div","product",label.join(" • ")));
-      const place=locationText(product.locations);
-      if(place)row.append(el("div","loc",place));
+  const groups=ingredientGroups(cocktail);
+  for(const group of groups){
+    const {ing,product,notice}=resolveSelection(group,items,savedGroups);
+    const row=el("div","item");row.dataset.requirementKey=group.requirementKey;
+    if(ing){
+      const qty=ing.displayQuantity || [ing.requiredQuantity,ing.requiredUnit].filter(x=>x!==null&&x!==undefined&&x!=="").join(" ");
+      const heading=el("div");
+      if(qty)heading.append(el("span","amount",`${qty}  `));
+      heading.append(document.createTextNode(nameOf(ing)));row.append(heading);
+      if(product){
+        const label=[product.brand,product.productName,[product.packageQuantity,product.packageUnit].filter(x=>x!==null&&x!==undefined&&x!=="").join(" ")].filter(Boolean);
+        if(product.brand && product.productName && String(product.productName).toLowerCase().includes(String(product.brand).toLowerCase()))label.shift();
+        row.append(el("div","product",label.join(" • ")));
+        const place=locationText(product.locations);
+        if(place)row.append(el("div","loc",place));
+      }else if(!notice){
+        row.append(el("div","muted",isAvailable(ing)?"No specific store product required":"Ask staff about availability"));
+      }
     }else{
-      row.append(el("div","muted",ing.available?"No specific store product required":"Ask staff about availability"));
+      row.append(el("div","",group.displayLabel || group.alternatives.map(nameOf).join(" OR ")));
     }
+    if(notice)row.append(el("div","warn",notice));
     card.append(row);
   }
-  if(!ingredients.length)card.append(el("p","muted","No ingredient details are available."));
+  if(!groups.length)card.append(el("p","muted","No ingredient details are available."));
   app.append(card);
   const steps=directions(cocktail.instructions);
   const instructions=el("section","card");instructions.append(el("h2","","DIRECTIONS"));
@@ -132,7 +202,6 @@ async function load(){
     if(!response.ok)throw new Error(`Supabase returned ${response.status}. Check function access and RLS policies.`);
     const data=await response.json();
     const rows=Array.isArray(data)?data:[data];
-    // The function may return SETOF jsonb (objects), or a one-column RPC response.
     const recipe=rows.map(x=>x?.get_stocktail_cocktails??x).find(x=>Number(x?.cocktail_id)===cocktailId);
     if(!recipe){fail("This recipe is not currently available. It may be out of stock.");return;}
     render(recipe);
